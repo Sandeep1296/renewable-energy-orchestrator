@@ -1,0 +1,6 @@
+{
+  "name": "Renewable Energy Orchestrator",
+  "description": "Autonomous multi-objective AI orchestrator for utility-scale solar, wind, battery storage, and dynamic grid operations with real-time objective weighting, DAG execution, and HITL governance.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

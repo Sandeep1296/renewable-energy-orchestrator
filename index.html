@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark light" />
+    <script>
+      try {
+        var t = localStorage.getItem('re-theme') || 'dark';
+        if (t === 'system') t = matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+        document.documentElement.dataset.theme = t;
+      } catch (e) { document.documentElement.dataset.theme = 'dark'; }
+    </script>
+    <title>Renewable Energy Orchestrator</title>
+    <meta name="description" content="Autonomous multi-objective AI orchestrator for utility-scale solar, wind, battery storage, and dynamic grid operations with real-time objective weighting, DAG execution, and HITL governance." />
+    <meta property="og:title" content="Renewable Energy Orchestrator" />
+    <meta property="og:description" content="Autonomous multi-objective AI orchestrator for utility-scale solar, wind, battery storage, and dynamic grid operations with real-time objective weighting, DAG execution, and HITL governance." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  </head>
+  <body class="bg-page text-paper antialiased font-sans selection:bg-emerald-500 selection:text-slate-950">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+

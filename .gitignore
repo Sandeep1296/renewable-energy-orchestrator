@@ -1,0 +1,40 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+build/
+dist/
+coverage/
+*.tsbuildinfo
+
+# Environment (secrets) — commit only the template
+.env*
+!.env.example
+
+# Runtime operator data (reseeds from code defaults on fresh boot)
+server/data/*.json
+server/data/*.bak
+server/data/*.tmp
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors & IDEs
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+
+# Vite / caches
+.vite/
+*.local
+
+# Misc
+*.pid

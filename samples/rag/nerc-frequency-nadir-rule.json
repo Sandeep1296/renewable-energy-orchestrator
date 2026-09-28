@@ -1,0 +1,7 @@
+{
+  "title": "NERC BAL-001-TRE-2 Frequency Nadir Rule (planning note)",
+  "category": "REGULATORY_STANDARD",
+  "summary": "Under-frequency load shedding stages and BESS fast-frequency-response obligations used for grounding checks.",
+  "content": "Stage 1 UFLS at 49.5 Hz sheds 5% of regional load. Utility BESS must inject rated active power within 500 ms of frequency falling below 49.90 Hz (IEEE 1547-2018 Category III) and must cease charging immediately. Sustained operation below 49.5 Hz for more than 30 seconds requires operator notification and staged demand-response dispatch before any market export is scheduled.",
+  "relevanceTags": ["NERC", "frequency", "UFLS", "FFR", "regulatory"]
+}

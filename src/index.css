@@ -1,0 +1,93 @@
+@import "tailwindcss";
+
+/* Semantic theme tokens: every app surface uses these, so Dark/Light themes
+ * swap with one data-theme attribute. Opacity modifiers (bg-panel/70) and
+ * variants (hover:, disabled:) compose automatically via @theme inline. */
+@theme inline {
+  --color-page: var(--th-page);
+  --color-panel: var(--th-panel);
+  --color-raise: var(--th-raise);
+  --color-strong: var(--th-strong);
+  --color-line: var(--th-line);
+  --color-linestrong: var(--th-linestrong);
+  --color-paper: var(--th-paper);
+  --color-soft: var(--th-soft);
+  --color-muted: var(--th-muted);
+  --color-faint: var(--th-faint);
+  --color-faintdeep: var(--th-faintdeep);
+  --color-onaccent: var(--th-onaccent);
+  --color-em: var(--th-em);
+  --color-cy: var(--th-cy);
+  --color-am: var(--th-am);
+  --color-ro: var(--th-ro);
+  --color-pu: var(--th-pu);
+}
+
+:root, [data-theme="dark"] {
+  color-scheme: dark;
+  --th-page: #020617;
+  --th-panel: #0f172a;
+  --th-raise: #1e293b;
+  --th-strong: #334155;
+  --th-line: #1e293b;
+  --th-linestrong: #334155;
+  --th-paper: #ffffff;
+  --th-soft: #cbd5e1;
+  --th-muted: #94a3b8;
+  --th-faint: #64748b;
+  --th-faintdeep: #475569;
+  --th-onaccent: #ffffff;
+  --th-em: #34d399;
+  --th-cy: #22d3ee;
+  --th-am: #fbbf24;
+  --th-ro: #fb7185;
+  --th-pu: #c084fc;
+}
+
+[data-theme="light"] {
+  color-scheme: light;
+  --th-page: #edf1f6;
+  --th-panel: #ffffff;
+  --th-raise: #f1f5f9;
+  --th-strong: #e2e8f0;
+  --th-line: #e2e8f0;
+  --th-linestrong: #cbd5e1;
+  --th-paper: #0f172a;
+  --th-soft: #334155;
+  --th-muted: #64748b;
+  --th-faint: #94a3b8;
+  --th-faintdeep: #475569;
+  --th-onaccent: #ffffff;
+  --th-em: #047857;
+  --th-cy: #0e7490;
+  --th-am: #b45309;
+  --th-ro: #be123c;
+  --th-pu: #7e22ce;
+}
+
+@layer base {
+  :root {
+    font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+  }
+
+  code, kbd, samp, pre, .font-mono {
+    font-family: 'JetBrains Mono', monospace;
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* Scrollbars follow the active theme */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: var(--th-page);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--th-raise);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--th-strong);
+}
