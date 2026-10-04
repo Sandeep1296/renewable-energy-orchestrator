@@ -39,6 +39,7 @@ const DEFAULT_SKILLS: Skill[] = [
   { id: 'FREQUENCY_ANALYSIS', name: 'Frequency Analysis', agentId: 'AGT-GRID', category: 'GRID_SKILLS', description: 'IEEE 1547 frequency droop assessment.', promptFragment: 'Enforce IEEE 1547-2018 Cat III: FFR discharge below 49.90Hz within 500ms; inhibit charging on under-frequency.', enabled: true, version: '1.1', updatedAt: new Date().toISOString() },
   { id: 'CONGESTION_DETECTION', name: 'Congestion Detection', agentId: 'AGT-GRID', category: 'GRID_SKILLS', description: 'Intertie thermal limit watch.', promptFragment: 'Respect Line North 150MW / South 120MW. Priority: charge locally, then DR, then curtail. Never approve export beyond SOL.', enabled: true, version: '1.0', updatedAt: new Date().toISOString() },
   { id: 'STABILITY_ASSESSMENT', name: 'Stability Assessment', agentId: 'AGT-GRID', category: 'GRID_SKILLS', description: 'Inertia and reserve adequacy.', promptFragment: 'Maintain 15% emergency reserve floor. Demand synthetic inertia on RoCoF < -0.12 Hz/s.', enabled: true, version: '1.0', updatedAt: new Date().toISOString() },
+  { id: 'TRACE_OUTAGE_IMPACT', name: 'Outage Blast-Radius Tracing', agentId: 'AGT-GRID', category: 'GRID_SKILLS', description: 'Graph traversal: lost export, forced curtailment, at-risk loads if a corridor trips.', promptFragment: 'When a corridor is stressed, state the trip blast-radius (lost export MW, forced curtail, at-risk flexible loads) before recommending curtailment.', enabled: true, version: '1.0', updatedAt: new Date().toISOString() },
   { id: 'PRICE_FORECASTING', name: 'Price Forecasting', agentId: 'AGT-MARKET', category: 'MARKET_SKILLS', description: 'Spot price regime classification.', promptFragment: 'Classify regime (spike >$150, negative <-$5). Only recommend aggressive export on verified spikes.', enabled: true, version: '1.0', updatedAt: new Date().toISOString() },
   { id: 'ARBITRAGE_OPPORTUNITY', name: 'Arbitrage Opportunity', agentId: 'AGT-MARKET', category: 'MARKET_SKILLS', description: 'Revenue vs degradation trade.', promptFragment: 'Weigh merchant revenue against degradation cost. NMC only for high-margin spikes.', enabled: true, version: '1.0', updatedAt: new Date().toISOString() },
   { id: 'DEMAND_RESPONSE_ANALYSIS', name: 'Demand Response Analysis', agentId: 'AGT-MARKET', category: 'MARKET_SKILLS', description: 'Flexible load shed valuation.', promptFragment: 'Value DR curtailment at ISO incentive ($/MWh). Shed only flexible MW with advance notice.', enabled: true, version: '1.0', updatedAt: new Date().toISOString() },
@@ -53,7 +54,18 @@ function ensureDataDir() {
 
 export function loadSkills(): Skill[] {
   ensureDataDir();
-  return readJson<Skill[]>(SKILLS_FILE, () => DEFAULT_SKILLS);
+  const skills = readJson<Skill[]>(SKILLS_FILE, () => DEFAULT_SKILLS);
+  // Migrate persisted registries: append skill definitions added in newer versions
+  const known = new Set(skills.map((s) => s.id));
+  const missing = DEFAULT_SKILLS.filter((s) => !known.has(s.id));
+  if (missing.length > 0) {
+    const merged = [...skills, ...missing];
+    try {
+      writeJsonAtomic(SKILLS_FILE, merged);
+    } catch { /* keep in-memory merged */ }
+    return merged;
+  }
+  return skills;
 }
 
 export function saveSkills(skills: Skill[]) {

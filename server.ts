@@ -7,12 +7,13 @@ import { fileURLToPath } from 'url';
 import { loadSkills, updateSkill } from './server/skills.js';
 import { loadRagDocs, saveRagDocs, searchRag } from './server/ragStore.js';
 import { loadDagDefinition, saveDagDefinition, executeDag } from './server/dagStore.js';
+import { loadPolicy } from './server/groundingConfig.js';
 import { PortfolioSchema, WeightsSchema, runGuardrails, assessHitl, confidenceScore } from './server/guardrails.js';
 import { buildCandidates, buildActions } from './server/scenarios.js';
 import { runSubAgentHandoff } from './server/subagents.js';
 import { supervise } from './server/supervisor.js';
 import { createPending, resolvePending, loadPending, loadAudit, appendAudit } from './server/hitlStore.js';
-import { optionalAuth, requireAuthIfConfigured, requireAdminIfConfigured, attachIdentityIfPresent, clerkEnabled } from './server/auth.js';
+import { optionalAuth, requireAuthIfConfigured, requireAdminIfConfigured, attachIdentityIfPresent, actorOf, clerkEnabled } from './server/auth.js';
 
 dotenv.config();
 
@@ -79,8 +80,133 @@ app.put('/api/weather/mode', requireAuthIfConfigured, async (req, res) => {
     return res.status(400).json({ error: "mode must be 'live', 'simulated', or 'auto'" });
   }
   setWeatherMode(mode as any);
-  appendAudit({ type: 'WEATHER_MODE', mode, by: (req as any).authUserId });
+  appendAudit({ type: 'WEATHER_MODE', mode, by: actorOf(req) });
   res.json(getWeatherMode());
+});
+
+// Topology impact queries: Aura-first read-back, in-memory fallback
+app.post('/api/graph/impact', async (req, res) => {
+  try {
+    const { analyzeImpact, syncToNeo4j, readTopologySnapshot } = await import('./server/graph.js');
+    let source: 'neo4j' | 'memory' = 'memory';
+    let result;
+    try {
+      const snap = await readTopologySnapshot();
+      const size = (snap?.solarFarms?.length || 0) + (snap?.windFarms?.length || 0) + (snap?.batteries?.length || 0);
+      if (snap && size > 0) {
+        result = analyzeImpact(snap, {
+          offlineAssetId: req.body.offlineAssetId,
+          removeIntertieId: req.body.removeIntertieId,
+        });
+        source = 'neo4j';
+      }
+    } catch { /* fall through to memory */ }
+    if (!result) {
+      result = analyzeImpact(req.body.portfolio || {}, {
+        offlineAssetId: req.body.offlineAssetId,
+        removeIntertieId: req.body.removeIntertieId,
+      });
+    }
+    let mirror = 'skipped';
+    try {
+      mirror = await syncToNeo4j(req.body.portfolio || {});
+    } catch { /* best effort; analysis already computed */ }
+    res.json({ ...result, source, mirror });
+  } catch (e: any) {
+    res.status(400).json({ error: e?.message || 'Impact analysis failed' });
+  }
+});
+
+// Grounding policy (admin-tunable tolerances; every change audited)
+app.get('/api/grounding/config', async (_req, res) => {
+  try {
+    const { loadPolicy, POLICY_BOUNDS, POLICY_DESCRIPTIONS, loadCustomRules, RULE_METRICS } = await import('./server/groundingConfig.js');
+    res.json({ policy: loadPolicy(), bounds: POLICY_BOUNDS, descriptions: POLICY_DESCRIPTIONS, customRules: loadCustomRules(), metrics: RULE_METRICS });
+  } catch (e: any) {
+    res.status(500).json({ error: e?.message || 'failed' });
+  }
+});
+app.put('/api/grounding/config', requireAdminIfConfigured, async (req, res) => {
+  try {
+    const { updatePolicy } = await import('./server/groundingConfig.js');
+    res.json({ policy: updatePolicy(req.body || {}, actorOf(req)) });
+  } catch (e: any) {
+    res.status(400).json({ error: e?.message || 'invalid policy update' });
+  }
+});
+app.post('/api/grounding/rules', requireAdminIfConfigured, async (req, res) => {
+  try {
+    const { createCustomRule } = await import('./server/groundingConfig.js');
+    res.status(201).json(createCustomRule(req.body || {}, actorOf(req)));
+  } catch (e: any) {
+    res.status(400).json({ error: e?.message || 'invalid rule' });
+  }
+});
+app.delete('/api/grounding/rules/:id', requireAdminIfConfigured, async (req, res) => {
+  try {
+    const { deleteCustomRule } = await import('./server/groundingConfig.js');
+    const ok = deleteCustomRule(req.params.id, actorOf(req));
+    if (!ok) return res.status(404).json({ error: 'Rule not found' });
+    res.json({ ok: true });
+  } catch (e: any) {
+    res.status(400).json({ error: e?.message || 'delete failed' });
+  }
+});
+
+// Neo4j Aura: direct status + full seeding (Admin for seed)
+app.get('/api/evals/history', async (_req, res) => {
+  try {
+    const { getEvalHistory } = await import('./server/evals.js');
+    res.json(getEvalHistory());
+  } catch (e: any) {
+    res.json([]);
+  }
+});
+app.get('/api/evals', async (_req, res) => {
+  try {
+    const { listEvals } = await import('./server/evals.js');
+    res.json(listEvals());
+  } catch (e: any) {
+    res.status(500).json({ error: e?.message || 'failed' });
+  }
+});
+app.post('/api/evals/run', async (req, res) => {
+  try {
+    const { runEvals } = await import('./server/evals.js');
+    const suites = req.body?.suites;
+    const includeLLM = suites ? suites.includes('llm') : true;
+    res.json(await runEvals(includeLLM));
+  } catch (e: any) {
+    res.status(500).json({ error: e?.message || 'eval run failed' });
+  }
+});
+app.get('/api/graph/status', async (_req, res) => {
+  try {
+    const { graphStatus, mirrorMode, lastSyncInfo, getLastSeededHash } = await import('./server/graph.js');
+    res.json({ ...(await graphStatus()), mirror: mirrorMode(), lastSync: lastSyncInfo(), lastSeededHash: getLastSeededHash() });
+  } catch (e: any) {
+    res.json({ reachable: false, error: e?.message || 'status failed' });
+  }
+});
+app.post('/api/graph/seed', requireAdminIfConfigured, async (req, res) => {
+  try {
+    const { seedNeo4j } = await import('./server/graph.js');
+    const r = await seedNeo4j(req.body.portfolio || {});
+    if (!r.ok) return res.status(502).json(r);
+    res.json(r);
+  } catch (e: any) {
+    res.status(500).json({ ok: false, error: e?.message || 'seed failed' });
+  }
+});
+app.post('/api/graph/prune', requireAdminIfConfigured, async (req, res) => {
+  try {
+    const { pruneOrphans } = await import('./server/graph.js');
+    const r = await pruneOrphans(req.body.portfolio || {});
+    appendAudit({ type: 'GRAPH_PRUNED', removed: r.removed, by: actorOf(req) });
+    res.json({ ok: true, ...r });
+  } catch (e: any) {
+    res.status(502).json({ ok: false, error: e?.message || 'prune failed' });
+  }
 });
 
 // Boot beacon: correlates page boots with server-side writers (audit log mtime
@@ -109,9 +235,9 @@ app.post('/api/boot', (req, res) => {
 app.get('/api/skills', (_req, res) => res.json(loadSkills()));
 app.put('/api/skills/:id', requireAdminIfConfigured, (req, res) => {
   try {
-    const updated = updateSkill(req.params.id, req.body, (req as any).authUserId);
+    const updated = updateSkill(req.params.id, req.body, actorOf(req));
     if (!updated) return res.status(404).json({ error: 'Skill not found' });
-    appendAudit({ type: 'SKILL_UPDATED', id: req.params.id, by: (req as any).authUserId });
+    appendAudit({ type: 'SKILL_UPDATED', id: req.params.id, by: actorOf(req) });
     res.json(updated);
   } catch (e: any) {
     res.status(400).json({ error: e?.message || 'Update failed' });
@@ -128,26 +254,26 @@ app.post('/api/rag/docs', requireAdminIfConfigured, (req, res) => {
     id: id || `RAG-USER-${Date.now().toString(36).toUpperCase()}`,
     title, category: category || 'HISTORICAL_CASE', summary: summary || title,
     content, relevanceTags: relevanceTags || [],
-    updatedAt: new Date().toISOString(), updatedBy: (req as any).authUserId,
+    updatedAt: new Date().toISOString(), updatedBy: actorOf(req),
   };
   docs.unshift(doc as any);
   saveRagDocs(docs);
-  appendAudit({ type: 'RAG_CREATED', id: doc.id, by: (req as any).authUserId });
+  appendAudit({ type: 'RAG_CREATED', id: doc.id, by: actorOf(req) });
   res.status(201).json(doc);
 });
 app.put('/api/rag/docs/:id', requireAdminIfConfigured, (req, res) => {
   const docs = loadRagDocs();
   const idx = docs.findIndex((d) => d.id === req.params.id);
   if (idx === -1) return res.status(404).json({ error: 'Doc not found' });
-  docs[idx] = { ...docs[idx], ...req.body, id: req.params.id, updatedAt: new Date().toISOString(), updatedBy: (req as any).authUserId };
+  docs[idx] = { ...docs[idx], ...req.body, id: req.params.id, updatedAt: new Date().toISOString(), updatedBy: actorOf(req) };
   saveRagDocs(docs);
-  appendAudit({ type: 'RAG_UPDATED', id: req.params.id, by: (req as any).authUserId });
+  appendAudit({ type: 'RAG_UPDATED', id: req.params.id, by: actorOf(req) });
   res.json(docs[idx]);
 });
 app.delete('/api/rag/docs/:id', requireAdminIfConfigured, (req, res) => {
   const docs = loadRagDocs().filter((d) => d.id !== req.params.id);
   saveRagDocs(docs);
-  appendAudit({ type: 'RAG_DELETED', id: req.params.id, by: (req as any).authUserId });
+  appendAudit({ type: 'RAG_DELETED', id: req.params.id, by: actorOf(req) });
   res.json({ ok: true });
 });
 
@@ -192,7 +318,7 @@ app.post('/api/rag/upload', requireAdminIfConfigured, async (req, res) => {
             category, summary: String(o.summary || o.title || name),
             content: String(o.content || JSON.stringify(o)).slice(0, 4000),
             relevanceTags: [...tags, ...((o.relevanceTags || []) as string[])].slice(0, 12),
-            updatedAt: new Date().toISOString(), updatedBy: (req as any).authUserId,
+            updatedAt: new Date().toISOString(), updatedBy: actorOf(req),
           }));
         } else {
           added = chunkText(text).map((chunk, i, arr) => ({
@@ -201,12 +327,12 @@ app.post('/api/rag/upload', requireAdminIfConfigured, async (req, res) => {
             category, summary: chunk.split('\n')[0].slice(0, 160) || name,
             content: chunk,
             relevanceTags: tags,
-            updatedAt: new Date().toISOString(), updatedBy: (req as any).authUserId,
+            updatedAt: new Date().toISOString(), updatedBy: actorOf(req),
           }));
         }
         docs.unshift(...added);
         saveRagDocs(docs);
-        appendAudit({ type: 'RAG_UPLOADED', files: added.map((d) => d.id), by: (req as any).authUserId });
+        appendAudit({ type: 'RAG_UPLOADED', files: added.map((d) => d.id), by: actorOf(req) });
         res.status(201).json({ ok: true, added: added.map((d) => ({ id: d.id, title: d.title })) });
       } catch (e: any) {
         res.status(400).json({ error: e?.message || 'Upload failed' });
@@ -224,7 +350,7 @@ app.put('/api/dag/definition', requireAdminIfConfigured, (req, res) => {
     const def = req.body;
     if (!Array.isArray(def)) return res.status(400).json({ error: 'Body must be DAG node array' });
     saveDagDefinition(def);
-    appendAudit({ type: 'DAG_UPDATED', by: (req as any).authUserId, nodes: def.length });
+    appendAudit({ type: 'DAG_UPDATED', by: actorOf(req), nodes: def.length });
     res.json(loadDagDefinition());
   } catch (e: any) {
     res.status(400).json({ error: e?.message || 'Invalid DAG' });
@@ -234,16 +360,26 @@ app.put('/api/dag/definition', requireAdminIfConfigured, (req, res) => {
 // ---------- HITL approval queue ----------
 app.get('/api/hitl/pending', (_req, res) => res.json(loadPending().filter((p) => p.status === 'PENDING_APPROVAL')));
 app.post('/api/hitl/:id/approve', requireAuthIfConfigured, (req, res) => {
-  const rec = resolvePending(req.params.id, 'APPROVED', (req as any).authUserId);
+  const rec = resolvePending(req.params.id, 'APPROVED', actorOf(req));
   if (!rec) return res.status(404).json({ error: 'Pending decision not found or already resolved' });
   res.json({ ok: true, pendingId: rec.pendingId, executed: true, note: 'Staged actuator commands released for dispatch.' });
 });
 app.post('/api/hitl/:id/reject', requireAuthIfConfigured, (req, res) => {
-  const rec = resolvePending(req.params.id, 'REJECTED', (req as any).authUserId);
+  const rec = resolvePending(req.params.id, 'REJECTED', actorOf(req));
   if (!rec) return res.status(404).json({ error: 'Pending decision not found or already resolved' });
   res.json({ ok: true, pendingId: rec.pendingId, executed: false, note: 'Staged plan rejected. Conservative-hold fallback recommended.' });
 });
 app.get('/api/audit/log', (_req, res) => res.json(loadAudit()));
+// Admin-only ledger reset (demo hygiene; writes its own audit marker)
+app.post('/api/audit/clear', requireAdminIfConfigured, async (req, res) => {
+  try {
+    const { clearAudit } = await import('./server/hitlStore.js');
+    clearAudit(actorOf(req));
+    res.json({ ok: true });
+  } catch (e: any) {
+    res.status(500).json({ error: e?.message || 'clear failed' });
+  }
+});
 
 // ---------- Real agentic orchestration ----------
 // Plan-then-execute: critical decisions return PENDING_APPROVAL with staged (unexecuted) actions.
@@ -252,7 +388,7 @@ app.post('/api/agentic-orchestrate', async (req, res) => {
   try {
     await attachIdentityIfPresent(req);
     const { chainStatus } = await import('./server/llm.js');
-    console.log(`[orchestrate] start op=${(req as any).authUserId || 'local-operator'} trigger=${req.body.trigger || '?'} llm=[${chainStatus()}] subagentMode=${process.env.SUBAGENT_MODE || 'batch'}`);
+    console.log(`[orchestrate] start op=${actorOf(req)} trigger=${req.body.trigger || '?'} llm=[${chainStatus()}] subagentMode=${process.env.SUBAGENT_MODE || 'batch'}`);
     const portfolio = PortfolioSchema.parse(req.body.portfolio);
     const weights = WeightsSchema.parse(req.body.weights);
     const previousDecision: any = req.body.previousDecision;
@@ -262,7 +398,7 @@ app.post('/api/agentic-orchestrate', async (req, res) => {
     const farmIds = [...(portfolio.solarFarms || []), ...(portfolio.windFarms || [])].map((a: any) => a.id);
     const liveWx = await fetchLiveWeather(farmIds);
     const blendNotes = liveWx.source === 'live' ? applyLiveWeather(portfolio, liveWx.readings) : [];
-    const operatorId = (req as any).authUserId || 'local-operator';
+    const operatorId = actorOf(req);
 
     const totalSolar = (portfolio.solarFarms || []).reduce((s: number, a: any) => s + (a.status === 'online' ? a.currentOutputMw || 0 : 0), 0);
     const totalWind = (portfolio.windFarms || []).reduce((s: number, a: any) => s + (a.status === 'online' ? a.currentOutputMw || 0 : 0), 0);
@@ -467,7 +603,7 @@ app.post('/api/agentic-orchestrate', async (req, res) => {
         { objective: 'Battery longevity', impact: 'LFP preferred over NMC to limit degradation.' },
       ],
       actions: actions.map((a) => ({ ...a, stagedOnly: !executed })),
-      groundingChecks, auditHash, dagNodes: fullDag, carbonMetrics,
+      groundingChecks, groundingPolicy: loadPolicy(), auditHash, dagNodes: fullDag, carbonMetrics,
       agenticTrace: {
         isAgentic: true, modelUsed: `${modelUsed} + ${verdict.modelUsed}`,
         thoughtTrace, toolsInvoked: toolTrace,

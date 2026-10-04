@@ -298,14 +298,26 @@ export function AuthSlot() {
   );
 }
 
-/** Attach Clerk session token (carries org_role when an org is active) to backend calls. */
+/** Attach Clerk session token (carries org_role when an org is active) to backend calls,
+ *  plus self-asserted operator identity headers so the audit ledger names a human
+ *  even in unenforced demo mode (attribution only — never authorization). */
 export async function authHeaders(): Promise<Record<string, string>> {
+  const out: Record<string, string> = {};
   try {
     const c = clerkInstance || (window as any).Clerk;
     if (c?.session) {
       const token = await c.session.getToken();
-      if (token) return { Authorization: `Bearer ${token}` };
+      if (token) out.Authorization = `Bearer ${token}`;
     }
+    const email = c?.user?.primaryEmailAddress?.emailAddress;
+    const name = [c?.user?.firstName, c?.user?.lastName].filter(Boolean).join(' ') || c?.user?.username;
+    if (email) out['X-Operator-Email'] = String(email).slice(0, 120);
+    if (name) out['X-Operator-Name'] = String(name).slice(0, 120);
+    if (c?.user?.id) out['X-Operator-Id'] = String(c.user.id).slice(0, 80);
+    const memberships = c?.user?.organizationMemberships || [];
+    const activeId = c?.organization?.id || c?.session?.lastActiveOrganizationId;
+    const active = memberships.find((m: any) => m.organization?.id === activeId) || memberships[0];
+    if (active?.role) out['X-Operator-Role'] = String(active.role).replace(/^org:/, '').slice(0, 40);
   } catch { /* anonymous */ }
-  return {};
+  return out;
 }

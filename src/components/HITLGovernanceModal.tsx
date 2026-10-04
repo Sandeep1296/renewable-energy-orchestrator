@@ -2,7 +2,7 @@ import React, { useState, useEffect, useMemo } from 'react';
 import { ShieldAlert, CheckCircle, XCircle, Clock, AlertTriangle, X, Lock } from 'lucide-react';
 import { OrchestrationDecision, ActionCommand, PortfolioState, ScenarioCandidate } from '../types/orchestrator';
 import { useCanApprove, useSession } from '../auth/ClerkWrapper';
-import { runGroundingValidation } from '../services/orchestrationEngine';
+import { runGroundingValidation, evaluateCustomRules } from '../services/orchestrationEngine';
 
 interface HITLGovernanceModalProps {
   decision: OrchestrationDecision;
@@ -24,17 +24,31 @@ export const HITLGovernanceModal: React.FC<HITLGovernanceModalProps> = ({
   onSelectScenario,
 }) => {
   const [secondsRemaining, setSecondsRemaining] = useState(decision.hitlTimeoutSec || 300);
+  const [busy, setBusy] = useState(false);
   const canApprove = useCanApprove();
   const session = useSession();
 
   // Per-scenario live grounding, so the approver never picks a violating plan.
   // Balance is checked against each scenario's ASSUMED inputs (stored at compute
   // time); a staleness banner below covers telemetry drift since then.
+  // Tolerances come from the admin-editable grounding policy (audited).
+  const [policy, setPolicy] = useState<{ powerBalanceToleranceMw: number; batteryPowerHeadroomMw: number } | null>(null);
+  const [customRules, setCustomRules] = useState<any[]>([]);
+  useEffect(() => {
+    if (!isOpen) return;
+    fetch('/api/grounding/config').then((r) => r.json()).then((j) => {
+      if (j.policy) setPolicy(j.policy);
+      if (Array.isArray(j.customRules)) setCustomRules(j.customRules);
+    }).catch(() => {});
+  }, [isOpen]);
   const scenarioGates = useMemo(() => {
     const m: Record<string, { fail: boolean; failIds: string[]; passCount: number; total: number }> = {};
     for (const sc of decision.allScenarios) {
       try {
-        const checks = runGroundingValidation(sc, portfolio);
+        const checks = runGroundingValidation(sc, portfolio, policy || undefined);
+        try {
+          checks.push(...evaluateCustomRules(portfolio, sc, customRules));
+        } catch { /* custom rules never break built-ins */ }
         const fails = checks.filter((c) => c.status === 'FAIL').map((c) => c.id);
         m[sc.id] = { fail: fails.length > 0, failIds: fails, passCount: checks.filter((c) => c.status === 'PASS').length, total: checks.length };
       } catch {
@@ -42,7 +56,7 @@ export const HITLGovernanceModal: React.FC<HITLGovernanceModalProps> = ({
       }
     }
     return m;
-  }, [decision, portfolio]);
+  }, [decision, portfolio, policy, customRules]);
 
   const liveCleanGen = useMemo(() => {
     const s = portfolio.solarFarms.reduce((sum: number, a) => sum + (a.status === 'online' ? a.currentOutputMw || 0 : 0), 0);
@@ -290,17 +304,23 @@ export const HITLGovernanceModal: React.FC<HITLGovernanceModalProps> = ({
               Dismiss
             </button>
             <button
-              onClick={() => {
-                onApprove();
+              onClick={async () => {
+                if (busy) return;
+                setBusy(true);
+                try {
+                  await onApprove();
+                } finally {
+                  setBusy(false);
+                }
                 onClose();
               }}
-              disabled={!canApprove}
+              disabled={!canApprove || busy}
               title={canApprove ? 'Approve staged dispatch' : 'Sign in as an org Member or Admin to approve'}
               className="px-4 py-2 text-xs font-semibold text-onaccent bg-emerald-600 rounded-lg hover:bg-emerald-500 disabled:opacity-50 transition-colors flex items-center gap-1.5 shadow-sm"
             >
               {!canApprove && <Lock className="w-4 h-4" />}
               {canApprove ? <CheckCircle className="w-4 h-4" /> : null}
-              <span>Approve & Dispatch Strategy{!session.local && session.role ? ` (${session.role})` : ''}</span>
+              <span>{busy ? 'Approving…' : `Approve & Dispatch Strategy${!session.local && session.role ? ` (${session.role})` : ''}`}</span>
             </button>
           </div>
         </div>

@@ -4,9 +4,15 @@ import { GroundingCheck } from '../types/orchestrator';
 
 interface GroundingAndSafetyPanelProps {
   checks: GroundingCheck[];
+  policy?: {
+    powerBalanceToleranceMw?: number;
+    batteryPowerHeadroomMw?: number;
+    n1GateEnabled?: boolean;
+    n1UnservedThresholdMw?: number;
+  } | null;
 }
 
-export const GroundingAndSafetyPanel: React.FC<GroundingAndSafetyPanelProps> = ({ checks }) => {
+export const GroundingAndSafetyPanel: React.FC<GroundingAndSafetyPanelProps> = ({ checks, policy = null }) => {
   const allPass = checks.every((c) => c.status === 'PASS');
   const failCount = checks.filter((c) => c.status === 'FAIL').length;
   const warnCount = checks.filter((c) => c.status === 'WARN').length;
@@ -21,6 +27,11 @@ export const GroundingAndSafetyPanel: React.FC<GroundingAndSafetyPanelProps> = (
           </h3>
         </div>
         <div className="flex items-center gap-2 font-mono text-xs">
+          {policy && (policy.powerBalanceToleranceMw !== undefined || policy.n1GateEnabled !== undefined) && (
+            <span className="text-faint font-normal" title="Admin-tuned grounding policy active on this decision (Knowledge → Grounding policy)">
+              policy: Δ≤{policy.powerBalanceToleranceMw ?? 1}MW · N-1 {policy.n1GateEnabled === false ? 'OFF' : 'ON'}
+            </span>
+          )}
           {allPass ? (
             <span className="text-em font-semibold flex items-center gap-1">
               <CheckCircle2 className="w-3.5 h-3.5" /> All Grounding Rules Verified

@@ -125,6 +125,38 @@ export function requirePermIfConfigured(perm: string) {
   };
 }
 
+function cleanHeader(v: unknown, max = 120): string | null {
+  const s = String(v || '').trim();
+  if (!s) return null;
+  return s.replace(/[\r\n\t]+/g, ' ').slice(0, max);
+}
+
+/**
+ * Who to blame in the audit ledger.
+ * - Enforced mode: the verified Clerk identity (+role) wins; extra claimed
+ *   details are appended only if they add information.
+ * - Demo/local mode: self-asserted X-Operator-* headers from the signed-in
+ *   Clerk client (or operator id), explicitly tagged [unverified] — audit
+ *   attribution, never authorization.
+ */
+export function actorOf(req: Request): string {
+  const verifiedId = (req as any).authUserId as string | undefined;
+  const verifiedRole = (req as any).authRole as string | undefined;
+  const h = req.headers as any;
+  const email = cleanHeader(h['x-operator-email']);
+  const name = cleanHeader(h['x-operator-name']);
+  const claimedId = cleanHeader(h['x-operator-id']);
+  const claimedRole = cleanHeader(h['x-operator-role']);
+  const who = [name, email].filter(Boolean).join(' ') || claimedId || '';
+  if (verifiedId && verifiedId !== 'local-operator') {
+    const role = verifiedRole ? ` [${verifiedRole}]` : '';
+    const extra = who && who !== verifiedId && !verifiedId.includes(who) ? ` (${who})` : '';
+    return `${verifiedId}${role}${extra}`;
+  }
+  if (who) return `${who}${claimedRole ? ` [${claimedRole}, unverified]` : ' [unverified]'}`;
+  return 'local-operator';
+}
+
 /** Any signed-in user (Member or Admin). Used for HITL approve/reject. */
 export async function requireAuthIfConfigured(req: Request, res: Response, next: NextFunction) {
   return requirePermIfConfigured('hitl:approve')(req, res, next);

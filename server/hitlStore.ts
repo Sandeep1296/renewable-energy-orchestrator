@@ -74,3 +74,11 @@ export function loadAudit(): any[] {
   ensure();
   try { return JSON.parse(fs.readFileSync(AUDIT_FILE, 'utf-8')); } catch { return []; }
 }
+
+/** Admin-only ledger reset. Writes a marker so the clear itself stays auditable. */
+export function clearAudit(by?: string): void {
+  ensure();
+  fs.writeFileSync(AUDIT_FILE, JSON.stringify([
+    { type: 'AUDIT_CLEARED', by: by || 'unknown', at: new Date().toISOString(), note: 'Ledger reset by admin; prior entries archived off-ledger.' },
+  ], null, 2));
+}

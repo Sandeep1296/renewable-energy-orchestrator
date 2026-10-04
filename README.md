@@ -82,6 +82,7 @@ Base: same origin. Auth: `Authorization: Bearer <Clerk session JWT>` where noted
 | `GET /api/health` | open | liveness + mode/keys/roles summary |
 | `POST /api/agentic-orchestrate` | open (identity attached if token sent) | `{portfolio, weights, disabledScenarios?, strictAI?, trigger?}` → full decision; `503 AI_UNAVAILABLE` in strict mode without LLMs |
 | `POST /api/ask-agent` | open | `{question, situationContext, decision}` → RAG-cited answer + `retrievedDocs` |
+| `POST /api/graph/impact` | open | `{portfolio, offlineAssetId?, removeIntertieId?}` → lost export, forced curtail, deficit, battery cover, at-risk loads (Grid-agent blast tool; optional Neo4j mirror) |
 | `GET /api/skills` | open | 15-skill registry |
 | `PUT /api/skills/:id` | **admin** | `{enabled, promptFragment, …}` (safety skills locked on) |
 | `GET /api/rag/docs` | open | codex list |
@@ -90,12 +91,18 @@ Base: same origin. Auth: `Authorization: Bearer <Clerk session JWT>` where noted
 | `DELETE /api/rag/docs/:id` | **admin** | remove |
 | `POST /api/rag/upload` | **admin** | multipart `file` (.md/.txt/.json/.csv ≤2MB) + optional `category`, `tags` |
 | `GET /api/dag/definition` | open | 14-node DAG (cycle-validated on write) |
-| `PUT /api/dag/definition` | **admin** | full node array (DAG-08 grounding locked on) |
+| `PUT /api/dag/definition` | **admin** | full node array (DAG-08 grounding + DAG-08S safety locked on) |
+| `GET /api/grounding/config` | open | tunable tolerances + hard bounds + descriptions |
+| `PUT /api/grounding/config` | **admin** | `{powerBalanceToleranceMw?, batteryPowerHeadroomMw?}` — bounds-enforced, audit-logged with diff |
+| `POST /api/grounding/rules` | **admin** | `{name, category, severity WARN\|FAIL, conditions[{metric, op, value}], message?}` → custom rule (audited) |
+| `DELETE /api/grounding/rules/:id` | **admin** | delete custom rule only (built-ins protected; audited) |
 | `GET /api/hitl/pending` | open | staged plans awaiting approval |
 | `POST /api/hitl/:id/approve` | member+ | release staged actuators |
 | `POST /api/hitl/:id/reject` | member+ | discard staged plan |
 | `GET /api/audit/log` | open | server ledger (append-only, 500 cap) |
 | `GET /api/llm/status` | open | provider usage, per-model stats, circuit + skip state |
+| `GET /api/evals` | open | list suite cases (deterministic + LLM-judge) |
+| `POST /api/evals/run` | open | `{suites?}` → pass/fail/skip report; LLM cases auto-skip on dead quota |
 | `GET /api/weather/mode` | open | `{configured, effective}` telemetry source |
 | `PUT /api/weather/mode` | member+ | `{mode: live\|simulated\|auto}` |
 | `POST /api/boot` | open | boot beacon (reload diagnostics) |

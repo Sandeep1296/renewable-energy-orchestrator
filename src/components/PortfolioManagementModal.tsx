@@ -28,6 +28,7 @@ import {
   ConsumerStatus,
 } from '../types/orchestrator';
 import { initialPortfolio } from '../data/initialPortfolio';
+import { usePermissions } from '../auth/ClerkWrapper';
 
 interface PortfolioManagementModalProps {
   isOpen: boolean;
@@ -50,6 +51,36 @@ export const PortfolioManagementModal: React.FC<PortfolioManagementModalProps> =
   const [isAddingNew, setIsAddingNew] = useState(false);
   const [addForm, setAddForm] = useState<any>({});
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
+  const perms = usePermissions();
+  const [impactId, setImpactId] = useState<string>('');
+  const [impact, setImpact] = useState<any | null>(null);
+  const [impactLoading, setImpactLoading] = useState(false);
+
+  const allAssets: Array<{ id: string; label: string }> = [
+    ...portfolio.solarFarms.map((a) => ({ id: a.id, label: `Solar · ${a.name}` })),
+    ...portfolio.windFarms.map((a) => ({ id: a.id, label: `Wind · ${a.name}` })),
+    ...portfolio.batteries.map((a) => ({ id: a.id, label: `BESS · ${a.name}` })),
+    ...portfolio.consumers.map((a) => ({ id: a.id, label: `Load · ${a.name}` })),
+    ...portfolio.interties.map((a) => ({ id: a.id, label: `Intertie · ${a.name}` })),
+  ];
+
+  const runImpact = async () => {
+    if (!impactId) return;
+    setImpactLoading(true);
+    try {
+      const isIntertie = portfolio.interties.some((i) => i.id === impactId);
+      const r = await fetch('/api/graph/impact', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(isIntertie ? { portfolio, removeIntertieId: impactId } : { portfolio, offlineAssetId: impactId }),
+      });
+      setImpact(r.ok ? await r.json() : { note: `Analysis failed (${r.status}).` });
+    } catch {
+      setImpact({ note: 'Analysis failed — backend unreachable.' });
+    } finally {
+      setImpactLoading(false);
+    }
+  };
 
   if (!isOpen) return null;
 
@@ -286,6 +317,69 @@ export const PortfolioManagementModal: React.FC<PortfolioManagementModalProps> =
           >
             <X className="w-5 h-5" />
           </button>
+        </div>
+
+        {/* Category Tabs & Add Button Bar */}
+        <div className="p-3 rounded-xl bg-page/60 border border-line space-y-2">
+          <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+            <div className="text-xs">
+              <span className="font-semibold text-paper">Outage impact simulator</span>
+              <span className="text-muted"> — pick any asset or intertie, preview the blast radius before you touch it.</span>
+            </div>
+          </div>
+          <div className="flex flex-col sm:flex-row gap-2">
+            <select
+              value={impactId}
+              onChange={(e) => { setImpactId(e.target.value); setImpact(null); }}
+              disabled={!perms.canOperate}
+              className="flex-1 bg-panel border border-linestrong rounded-lg px-2.5 py-1.5 text-xs text-paper disabled:opacity-50"
+            >
+              <option value="">Select asset or intertie…</option>
+              {allAssets.map((a) => (
+                <option key={a.id} value={a.id}>{a.label}</option>
+              ))}
+            </select>
+            <button
+              onClick={runImpact}
+              disabled={!impactId || impactLoading || !perms.canOperate}
+              title={perms.canOperate ? 'Simulate removal' : 'Requires Operator role or above'}
+              className="px-3 py-1.5 text-xs font-semibold text-onaccent bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 rounded-lg transition-colors whitespace-nowrap"
+            >
+              {impactLoading ? 'Analyzing…' : 'Simulate outage'}
+            </button>
+          </div>
+          {impact && (
+            <div className="text-xs space-y-1.5 p-3 rounded-lg bg-panel border border-line">
+              <div className="flex items-center justify-between gap-2">
+                <div className="font-mono font-bold text-paper">{impact.scenario}</div>
+                {impact.source && (
+                  <span title={impact.source === 'neo4j' ? 'Answered from the Neo4j Aura mirror' : 'Answered from in-process graph math (Aura unreachable/off)'} className={`font-mono text-[10px] px-1.5 py-px rounded border shrink-0 ${impact.source === 'neo4j' ? 'text-pu border-purple-500/40 bg-purple-500/10' : 'text-faint border-linestrong bg-raise'}`}>
+                    {impact.source === 'neo4j' ? '◉ NEO4J' : '○ MEMORY'}
+                  </span>
+                )}
+              </div>
+              <div className="grid grid-cols-3 gap-2 text-center font-mono">
+                <div className="p-2 rounded bg-page border border-line">
+                  <div className="text-[10px] text-faint">FORCED CURTAIL</div>
+                  <div className="font-bold text-am tabular-nums">{impact.forcedCurtailMw} MW</div>
+                </div>
+                <div className="p-2 rounded bg-page border border-line">
+                  <div className="text-[10px] text-faint">BATTERY COVER</div>
+                  <div className="font-bold text-cy tabular-nums">{impact.batteryCoverMw} MW</div>
+                </div>
+                <div className="p-2 rounded bg-page border border-line">
+                  <div className="text-[10px] text-faint">UNSERVED</div>
+                  <div className={`font-bold tabular-nums ${impact.deficitMw > 0 ? 'text-ro' : 'text-em'}`}>{impact.deficitMw} MW</div>
+                </div>
+              </div>
+              {impact.affectedConsumers?.length > 0 && (
+                <div className="text-[11px] text-muted">
+                  At-risk loads: {impact.affectedConsumers.map((c: any) => `${c.name} (${c.atRiskMw} MW)`).join(', ')}
+                </div>
+              )}
+              <div className="text-[11px] text-soft">{impact.note}</div>
+            </div>
+          )}
         </div>
 
         {/* Category Tabs & Add Button Bar */}

@@ -98,6 +98,8 @@ export function saveDagDefinition(def: DagDefNode[]) {
   // Safety nodes cannot be disabled
   const grounding = def.find((n) => n.id === 'DAG-08');
   if (grounding && !grounding.enabled) throw new Error('DAG-08 grounding gate cannot be disabled');
+  const safety = def.find((n) => n.id === 'DAG-08S');
+  if (safety && !safety.enabled) throw new Error('DAG-08S safety screen cannot be disabled');
   ensure();
   writeJsonAtomic(DAG_FILE, def);
 }

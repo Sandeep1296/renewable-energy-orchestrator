@@ -137,16 +137,16 @@ export const DAGVisualizer: React.FC<DAGVisualizerProps> = ({ nodes, live = fals
 
       {editMode && def && (
         <div className="p-3 rounded-lg bg-page border border-amber-500/30 space-y-2 text-xs">
-          <div className="text-am font-semibold">User-editable DAG definition (enable/disable nodes; DAG-08 grounding locked; cycles rejected server-side)</div>
+          <div className="text-am font-semibold">User-editable DAG definition (enable/disable nodes; DAG-08 grounding + DAG-08S safety screen locked; cycles rejected server-side)</div>
           {def.map((n) => (
             <div key={n.id} className="flex items-center justify-between gap-2 p-2 rounded bg-panel border border-line">
               <span className="font-mono text-soft">{n.id} · {n.name} <span className="text-faint">← {n.dependsOn.join(', ') || 'root'}</span></span>
               <button
                 onClick={() => setDef(def.map((d) => (d.id === n.id ? { ...d, enabled: !d.enabled } : d)))}
-                disabled={n.id === 'DAG-08'}
+                disabled={n.id === 'DAG-08' || n.id === 'DAG-08S'}
                 className={`px-2 py-0.5 rounded text-[11px] font-semibold ${n.enabled ? 'bg-emerald-500/15 text-em' : 'bg-raise text-faint'}`}
               >
-                {n.id === 'DAG-08' ? 'LOCKED ON' : n.enabled ? 'ON' : 'OFF'}
+                {n.id === 'DAG-08' || n.id === 'DAG-08S' ? 'LOCKED ON' : n.enabled ? 'ON' : 'OFF'}
               </button>
             </div>
           ))}

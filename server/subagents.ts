@@ -1,6 +1,7 @@
 import { loadSkills } from './skills.js';
 import { searchRag } from './ragStore.js';
 import { invokeWithFallback } from './llm.js';
+import { analyzeImpact } from './graph.js';
 
 export interface SubAgentResult {
   agentId: string;
@@ -50,7 +51,15 @@ function runSkillTools(agentId: string, portfolio: any): { toolsUsed: string[]; 
     }
     case 'AGT-GRID': {
       const flows = (portfolio.interties || []).map((i: any) => `${i.id || i.name} ${i.currentFlowMw}/${i.limitMw}MW`).join('; ');
-      return { toolsUsed: ['FREQUENCY_ANALYSIS', 'CONGESTION_DETECTION', 'STABILITY_ASSESSMENT'], evidence: `Freq ${freq.toFixed(2)} Hz (${portfolio.grid?.frequencyStatus}). Flows: ${flows}.` };
+      let blast = '';
+      const stressed = (portfolio.interties || []).find((i: any) => i.congested || (Math.abs(i.currentFlowMw || 0) / (i.limitMw || 1)) > 0.9);
+      if (stressed) {
+        try {
+          const impact = analyzeImpact(portfolio, { removeIntertieId: stressed.id });
+          blast = ` Blast-radius if ${stressed.id} trips: ${impact.note}`;
+        } catch { /* evidence stays topological */ }
+      }
+      return { toolsUsed: ['FREQUENCY_ANALYSIS', 'CONGESTION_DETECTION', 'STABILITY_ASSESSMENT', 'TRACE_OUTAGE_IMPACT'], evidence: `Freq ${freq.toFixed(2)} Hz (${portfolio.grid?.frequencyStatus}). Flows: ${flows}.${blast}` };
     }
     case 'AGT-MARKET': {
       const regime = price > 150 ? 'SPIKE' : price < -5 ? 'NEGATIVE' : 'NORMAL';

@@ -14,6 +14,8 @@ export function runOrchestrationEngine(
   weights: ObjectiveWeights,
   previousDecision?: OrchestrationDecision,
   disabledIds: string[] = [],
+  customRules: CustomGroundingRuleInput[] = [],
+  policy?: { powerBalanceToleranceMw?: number; batteryPowerHeadroomMw?: number; n1GateEnabled?: boolean; n1UnservedThresholdMw?: number },
 ): OrchestrationDecision {
   const startTime = Date.now();
 
@@ -37,12 +39,20 @@ export function runOrchestrationEngine(
     buildRenewableChargeScenario(state, totalCleanGen, totalRawDemand, maxExportCapacity),
   ];
 
-  // 3. Multi-objective scoring
+  // Curtail solar first (regulatory merit order), remainder wind
+  const onlineSolarOut = state.solarFarms.reduce((acc, s) => acc + (s.status === 'online' ? s.currentOutputMw : 0), 0);
+  candidates.forEach((cand) => {
+    const total = cand.curtailmentMw.solar + cand.curtailmentMw.wind;
+    const solarCurt = Math.round(Math.min(total, onlineSolarOut) * 10) / 10;
+    cand.curtailmentMw = { solar: solarCurt, wind: Math.round(Math.max(0, total - solarCurt) * 10) / 10 };
+  });
+
+  // 3. Multi-objective scoring (relative normalization across the set)
   candidates.forEach((cand) => {
     cand.assumedCleanGenMw = Math.round(totalCleanGen * 10) / 10;
     cand.assumedDemandMw = Math.round(totalRawDemand * 10) / 10;
-    scoreScenario(cand, weights, state);
   });
+  scoreAllScenarios(candidates, weights, state);
 
   // Sort by composite score descending (operator-disabled strategies rank last)
   const disabled = new Set(disabledIds);
@@ -57,7 +67,10 @@ export function runOrchestrationEngine(
   const selectedScenario = enabled[0];
 
   // 4. Grounding and physical validation checks
-  const groundingChecks = runGroundingValidation(selectedScenario, state);
+  const groundingChecks = runGroundingValidation(selectedScenario, state, policy || undefined);
+  try {
+    groundingChecks.push(...evaluateCustomRules(state, selectedScenario, customRules));
+  } catch { /* custom rules never break built-ins */ }
 
   // 5. Calculate confidence score and HITL status
   const confidencePct = calculateConfidence(state, selectedScenario, groundingChecks);
@@ -142,6 +155,7 @@ export function runOrchestrationEngine(
     tradeoffs,
     actions,
     groundingChecks,
+    groundingPolicy: policy ? { ...policy } : undefined,
     auditHash,
     dagNodes,
     carbonMetrics,
@@ -337,16 +351,21 @@ function buildDemandResponseScenario(
   demand: number,
   maxExport: number,
 ): ScenarioCandidate {
-  // Curtail 75% of flexible industrial demand
+  // Shed 50% + shift 25% of flexible industrial demand (rebound +1 cycle)
   const drMap: Record<string, number> = {};
+  const shiftMap: Record<string, number> = {};
   let totalDrCurtailed = 0;
+  let totalShifted = 0;
   state.consumers.forEach((c) => {
-    const curtailed = c.status === 'offline' ? 0 : Math.round(c.flexibleDemandMw * 0.75 * 10) / 10;
+    const curtailed = c.status === 'offline' ? 0 : Math.round(c.flexibleDemandMw * 0.5 * 10) / 10;
+    const shifted = c.status === 'offline' ? 0 : Math.round(c.flexibleDemandMw * 0.25 * 10) / 10;
     drMap[c.id] = curtailed;
+    shiftMap[c.id] = shifted;
     totalDrCurtailed += curtailed;
+    totalShifted += shifted;
   });
 
-  const effectiveDemand = demand - totalDrCurtailed;
+  const effectiveDemand = demand - totalDrCurtailed - totalShifted;
   const deficit = effectiveDemand - cleanGen;
 
   const batteryDispatchMw: Record<string, number> = {};
@@ -374,21 +393,23 @@ function buildDemandResponseScenario(
   const actualImport = Math.max(0, -netBalance);
 
   const price = state.market.spotPriceUsdPerMwh;
-  // DR compensation paid to industrial customers
+  // DR compensation paid to industrial customers (shed only); shifted load
+  // rebounds off-peak, valued at half price as avoided peak cost
   const drPaymentCost = totalDrCurtailed * state.market.drIncentiveUsdPerMwh * 0.25;
   const cost = (actualImport * Math.max(0, price) * 0.25) +
                (actualImport * state.market.carbonPriceUsdPerTon * 0.42 * 0.25) +
                drPaymentCost;
-  const revenue = actualExport * Math.max(0, price) * 0.25;
+  const revenue = actualExport * Math.max(0, price) * 0.25 + totalShifted * Math.max(0, price) * 0.5 * 0.25;
 
   return {
     id: 'DEMAND_RESPONSE',
     name: 'Industrial Demand Response & Peak Shaving',
     strategyKicker: 'Load Flexibility & Grid Stress Relief',
-    description: 'Enacts demand response across industrial partners to shed non-critical load, relieving grid and line stress.',
+    description: 'Sheds 50% of flexible industrial load and shifts 25% to the off-peak window (rebound +1 cycle), relieving grid and line stress.',
     batteryDispatchMw,
     curtailmentMw: { solar: 0, wind: 0 },
     demandResponseCurtailMw: drMap,
+    loadShiftMw: shiftMap,
     gridNetImportMw: actualImport - actualExport,
     projectedCostUsd: cost,
     projectedRevenueUsd: revenue,
@@ -464,34 +485,25 @@ function buildRenewableChargeScenario(
   };
 }
 
-// Multi-attribute utility function calculation
-function scoreScenario(candidate: ScenarioCandidate, weights: ObjectiveWeights, state: PortfolioState) {
-  // Normalize each metric to 0 - 100 scale:
-  // 1. Cost score: Higher is better (lower cost / higher profit)
-  const netImpact = candidate.netEconomicImpactUsd;
-  const costScore = Math.max(0, Math.min(100, 50 + (netImpact / 200)));
+// Multi-attribute utility: two-pass scoring. Cost, emissions, curtailment and
+// arbitrage are normalized RELATIVELY across the candidate set each cycle
+// (min-max), so real economic spreads always discriminate fully. Health-like
+// metrics (degradation, reliability, renewable %) keep absolute scales.
+function scoreAllScenarios(candidates: ScenarioCandidate[], weights: ObjectiveWeights, state: PortfolioState) {
+  const rel = (vals: number[], higherBetter: boolean): number[] => {
+    const lo = Math.min(...vals);
+    const hi = Math.max(...vals);
+    return vals.map((v) => {
+      if (hi === lo) return 50;
+      const s = higherBetter ? ((v - lo) / (hi - lo)) * 100 : ((hi - v) / (hi - lo)) * 100;
+      return Math.round(s * 10) / 10;
+    });
+  };
 
-  // 2. Emissions score: 0 tons = 100, >15 tons = 0
-  const emissionsScore = Math.max(0, Math.min(100, 100 - (candidate.projectedEmissionsTons * 8)));
-
-  // 3. Curtailment score: 0 MWh = 100
-  const curtailmentScore = Math.max(0, Math.min(100, 100 - (candidate.curtailmentMwh * 5)));
-
-  // 4. Battery degradation score
-  const degradationScore = candidate.batteryDegradationScore;
-
-  // 5. Reliability score
-  let reliabilityScore = candidate.reliabilityScore;
-  // If grid frequency is in warning or emergency, bump importance
-  if (state.grid.frequencyStatus === 'emergency') {
-    reliabilityScore = Math.max(30, reliabilityScore - 10);
-  }
-
-  // 6. Renewable utilization score
-  const renewableScore = candidate.renewableUtilizationPct;
-
-  // 7. Arbitrage profit score
-  const arbitrageScore = Math.max(0, Math.min(100, candidate.projectedRevenueUsd > 0 ? 50 + (candidate.projectedRevenueUsd / 100) : 30));
+  const costS = rel(candidates.map((c) => c.netEconomicImpactUsd), true);
+  const emisS = rel(candidates.map((c) => c.projectedEmissionsTons), false);
+  const curtS = rel(candidates.map((c) => c.curtailmentMwh), false);
+  const arbS = rel(candidates.map((c) => c.projectedRevenueUsd), true);
 
   const totalWeight =
     weights.minimizeCost +
@@ -502,40 +514,64 @@ function scoreScenario(candidate: ScenarioCandidate, weights: ObjectiveWeights, 
     weights.maximizeRenewableUtilization +
     weights.maximizeArbitrageProfit || 1;
 
-  const composite =
-    (costScore * weights.minimizeCost +
-      emissionsScore * weights.minimizeEmissions +
-      curtailmentScore * weights.minimizeCurtailment +
-      degradationScore * weights.minimizeBatteryDegradation +
-      reliabilityScore * weights.maximizeReliability +
-      renewableScore * weights.maximizeRenewableUtilization +
-      arbitrageScore * weights.maximizeArbitrageProfit) /
-    totalWeight;
+  candidates.forEach((candidate, i) => {
+    const costScore = costS[i];
+    const emissionsScore = emisS[i];
+    const curtailmentScore = curtS[i];
+    // 4. Battery degradation score
+    const degradationScore = candidate.batteryDegradationScore;
 
-  candidate.scores = {
-    cost: { raw: costScore, weighted: (costScore * weights.minimizeCost) / totalWeight },
-    emissions: { raw: emissionsScore, weighted: (emissionsScore * weights.minimizeEmissions) / totalWeight },
-    curtailment: { raw: curtailmentScore, weighted: (curtailmentScore * weights.minimizeCurtailment) / totalWeight },
-    batteryDegradation: { raw: degradationScore, weighted: (degradationScore * weights.minimizeBatteryDegradation) / totalWeight },
-    reliability: { raw: reliabilityScore, weighted: (reliabilityScore * weights.maximizeReliability) / totalWeight },
-    renewableUtilization: { raw: renewableScore, weighted: (renewableScore * weights.maximizeRenewableUtilization) / totalWeight },
-    arbitrageProfit: { raw: arbitrageScore, weighted: (arbitrageScore * weights.maximizeArbitrageProfit) / totalWeight },
-  };
+    // 5. Reliability score
+    let reliabilityScore = candidate.reliabilityScore;
+    // If grid frequency is in warning or emergency, bump importance
+    if (state.grid.frequencyStatus === 'emergency') {
+      reliabilityScore = Math.max(30, reliabilityScore - 10);
+    }
 
-  candidate.compositeUtilityScore = Math.round(composite * 10) / 10;
+    // 6. Renewable utilization score
+    const renewableScore = candidate.renewableUtilizationPct;
+
+    // 7. Arbitrage profit score
+    const arbitrageScore = arbS[i];
+
+    const composite =
+      (costScore * weights.minimizeCost +
+        emissionsScore * weights.minimizeEmissions +
+        curtailmentScore * weights.minimizeCurtailment +
+        degradationScore * weights.minimizeBatteryDegradation +
+        reliabilityScore * weights.maximizeReliability +
+        renewableScore * weights.maximizeRenewableUtilization +
+        arbitrageScore * weights.maximizeArbitrageProfit) /
+      totalWeight;
+
+    candidate.scores = {
+      cost: { raw: costScore, weighted: (costScore * weights.minimizeCost) / totalWeight },
+      emissions: { raw: emissionsScore, weighted: (emissionsScore * weights.minimizeEmissions) / totalWeight },
+      curtailment: { raw: curtailmentScore, weighted: (curtailmentScore * weights.minimizeCurtailment) / totalWeight },
+      batteryDegradation: { raw: degradationScore, weighted: (degradationScore * weights.minimizeBatteryDegradation) / totalWeight },
+      reliability: { raw: reliabilityScore, weighted: (reliabilityScore * weights.maximizeReliability) / totalWeight },
+      renewableUtilization: { raw: renewableScore, weighted: (renewableScore * weights.maximizeRenewableUtilization) / totalWeight },
+      arbitrageProfit: { raw: arbitrageScore, weighted: (arbitrageScore * weights.maximizeArbitrageProfit) / totalWeight },
+    };
+
+    candidate.compositeUtilityScore = Math.round(composite * 10) / 10;
+  });
 }
 
 // Rigorous grounding and physical validation checks
 export function runGroundingValidation(
   scenario: ScenarioCandidate,
   state: PortfolioState,
+  cfg: { powerBalanceToleranceMw?: number; batteryPowerHeadroomMw?: number; n1GateEnabled?: boolean; n1UnservedThresholdMw?: number } = {},
 ): GroundingCheck[] {
+  const tolerance = cfg.powerBalanceToleranceMw ?? 1.0;
+  const headroom = cfg.batteryPowerHeadroomMw ?? 0.1;
   const checks: GroundingCheck[] = [];
 
   // Check 1 & 2: Dynamic battery power and health limits
   state.batteries.forEach((b, idx) => {
     const bPower = Math.abs(scenario.batteryDispatchMw[b.id] || 0);
-    const isPass = b.status === 'fault' ? bPower === 0 : bPower <= b.powerRatingMw + 0.1;
+    const isPass = b.status === 'fault' ? bPower === 0 : bPower <= b.powerRatingMw + headroom;
     checks.push({
       id: `PHYS-BATT-${b.id || idx + 1}`,
       category: 'BATTERY_SAFETY',
@@ -578,7 +614,8 @@ export function runGroundingValidation(
   const totalGen = scenario.assumedCleanGenMw ?? liveGen;
   const bDispatch = Object.values(scenario.batteryDispatchMw).reduce((sum, v) => sum + v, 0);
   const drShed = Object.values(scenario.demandResponseCurtailMw).reduce((a, b) => a + b, 0);
-  const effectiveDemand = (scenario.assumedDemandMw ?? state.grid.totalDemandMw) - drShed;
+  const shifted = Object.values(scenario.loadShiftMw || {}).reduce((a, b) => a + (Number(b) || 0), 0);
+  const effectiveDemand = (scenario.assumedDemandMw ?? state.grid.totalDemandMw) - drShed - shifted;
   const netExchange = scenario.gridNetImportMw; // + = import, - = export
   const curtailment = scenario.curtailmentMw.solar + scenario.curtailmentMw.wind;
 
@@ -586,15 +623,48 @@ export function runGroundingValidation(
   const supply = totalGen + (netExchange > 0 ? netExchange : 0) + (bDispatch > 0 ? bDispatch : 0);
   const demand = effectiveDemand + (netExchange < 0 ? -netExchange : 0) + (bDispatch < 0 ? -bDispatch : 0) + curtailment;
   const powerBalanceError = Math.abs(supply - demand);
-  const balancePass = powerBalanceError < 1.0;
+  const balancePass = powerBalanceError < tolerance;
 
   checks.push({
     id: 'PHYS-CONSERV-ENERGY',
     category: 'PHYSICAL',
     rule: 'First Law of Thermodynamics: Instantaneous supply must strictly match instantaneous demand & storage',
     status: balancePass ? 'PASS' : 'FAIL',
-    detail: `Supply: ${supply.toFixed(1)} MW / Demand+Storage: ${demand.toFixed(1)} MW (Delta: ${powerBalanceError.toFixed(2)} MW)`,
+    detail: `Supply: ${supply.toFixed(1)} MW / Demand+Storage: ${demand.toFixed(1)} MW (Delta: ${powerBalanceError.toFixed(2)} MW, tolerance ${tolerance} MW)`,
   });
+
+  // Check 5b: N-1 contingency screen (toggleable; never blocks on its own errors)
+  if (cfg.n1GateEnabled !== false) {
+    try {
+      const threshold = cfg.n1UnservedThresholdMw ?? 25;
+      const cleanNow = state.solarFarms.reduce((sum, s) => sum + (s.status === 'online' ? s.currentOutputMw : 0), 0)
+        + state.windFarms.reduce((sum, w) => sum + (w.status === 'online' ? w.currentOutputMw : 0), 0);
+      const battCover = state.batteries
+        .filter((b) => b.status !== 'fault' && b.status !== 'maintenance' && b.currentSocPct > b.minSocPct)
+        .reduce((sum, b) => sum + Math.min(b.powerRatingMw, ((b.currentSocPct - b.minSocPct) / 100) * b.capacityMwh * 4), 0);
+      const drShedN1 = Object.values(scenario.demandResponseCurtailMw).reduce((a, b) => a + b, 0);
+      const demN1 = state.grid.totalDemandMw - drShedN1;
+      let worst = { label: 'none', unserved: 0 };
+      const consider = (label: string, gen: number) => {
+        const u = Math.max(0, Math.round((demN1 - gen - battCover) * 10) / 10);
+        if (u > worst.unserved) worst = { label, unserved: u };
+      };
+      for (const a of [...state.solarFarms, ...state.windFarms]) {
+        if (a.status !== 'online') continue;
+        consider(`loss of ${a.id}`, cleanNow - a.currentOutputMw);
+      }
+      const breach = worst.unserved > threshold;
+      checks.push({
+        id: 'N1-CONTINGENCY',
+        category: 'GRID_CONSTRAINT',
+        rule: `N-1 secure: worst single loss leaves < ${threshold} MW unserved`,
+        status: breach ? 'FAIL' : 'PASS',
+        detail: breach
+          ? `VIOLATION under ${worst.label} (${worst.unserved} MW unserved after storage) — staged for human review`
+          : `Worst single loss (${worst.label}) leaves ${worst.unserved} MW unserved — within tolerance`,
+      });
+    } catch { /* N-1 never blocks on its own errors */ }
+  }
 
   // Check 5: IEEE 1547-2018 Regulatory Frequency Compliance
   const freq = state.grid.frequencyHz;
@@ -706,6 +776,22 @@ export function generateActionCommands(
     }
   });
 
+  // Load shifting (shed now, rebound off-peak next cycle)
+  Object.entries(scenario.loadShiftMw || {}).forEach(([cId, mw]) => {
+    const v = Number(mw) || 0;
+    if (v > 0) {
+      const consumer = state.consumers.find((c) => c.id === cId);
+      actions.push({
+        assetId: cId,
+        assetName: consumer?.name || cId,
+        type: 'SHIFT_LOAD',
+        valueMw: v,
+        detail: `Shift ${v.toFixed(1)} MW to off-peak window (rebound +1 cycle).`,
+        precondition: 'Rebound capacity reserved next cycle',
+      });
+    }
+  });
+
   // Grid Intertie Exchange
   if (scenario.gridNetImportMw < 0) {
     const exportMw = -scenario.gridNetImportMw;
@@ -728,7 +814,17 @@ export function generateActionCommands(
     });
   }
 
-  // Curtailment actions if required
+  // Curtailment actions if required (solar first per merit order)
+  if (scenario.curtailmentMw.solar > 0) {
+    actions.push({
+      assetId: 'SOL-FLEET',
+      assetName: 'Solar Generation Fleet',
+      type: 'CURTAIL_SOLAR',
+      valueMw: scenario.curtailmentMw.solar,
+      detail: `Curtail ${scenario.curtailmentMw.solar.toFixed(1)} MW solar output (merit order first) to respect export/storage limits.`,
+      precondition: 'Transmission intertie thermal constraint active',
+    });
+  }
   if (scenario.curtailmentMw.wind > 0) {
     actions.push({
       assetId: 'WND-FLEET',
@@ -740,6 +836,40 @@ export function generateActionCommands(
     });
   }
 
+  actions.push(...planMaintenanceActions(state));
+
+  return actions;
+}
+
+/**
+ * Maintenance domain planner (mirrors server/scenarios.ts planMaintenanceActions):
+ * fault → inspection; overheat/degradation/gust → schedule; maintenance during
+ * emergency → delay (hold return-to-service).
+ */
+export function planMaintenanceActions(state: PortfolioState): ActionCommand[] {
+  const actions: ActionCommand[] = [];
+  const emergency = state.grid.frequencyStatus === 'emergency'
+    || state.market.spotPriceUsdPerMwh > 200
+    || state.weather.stormAlert;
+  state.batteries.forEach((b) => {
+    if (b.status === 'fault') {
+      actions.push({ assetId: b.id, assetName: b.name, type: 'DISPATCH_INSPECTION', valueMw: 0, detail: 'Dispatch crew to diagnose inverter fault', precondition: 'Fault event logged' });
+    } else if (b.status === 'maintenance' && emergency) {
+      actions.push({ assetId: b.id, assetName: b.name, type: 'DELAY_MAINTENANCE', valueMw: 0, detail: 'Hold return-to-service during grid emergency', precondition: 'Emergency declared' });
+    } else if (b.tempC > 38 && b.status !== 'maintenance') {
+      actions.push({ assetId: b.id, assetName: b.name, type: 'SCHEDULE_MAINTENANCE', valueMw: 0, detail: `Cooling inspection due (cell ${b.tempC.toFixed(1)}°C), next low-price window`, precondition: 'Off-peak window available' });
+    }
+  });
+  state.solarFarms.forEach((s) => {
+    if (s.degradationPct > 1.5 && s.status === 'online') {
+      actions.push({ assetId: s.id, assetName: s.name, type: 'SCHEDULE_MAINTENANCE', valueMw: 0, detail: `Cleaning + IV-curve test due (degradation ${s.degradationPct.toFixed(1)}%)`, precondition: 'Low-irradiance window' });
+    }
+  });
+  state.windFarms.forEach((w) => {
+    if (w.gustWarning && w.status === 'online') {
+      actions.push({ assetId: w.id, assetName: w.name, type: 'DISPATCH_INSPECTION', valueMw: 0, detail: 'Post-gust blade/pitch inspection after storm front passes', precondition: 'Wind below 20 m/s' });
+    }
+  });
   return actions;
 }
 
@@ -924,4 +1054,82 @@ function buildDAGExecutionTrace(state: PortfolioState, selected: ScenarioCandida
       dependsOn: ['DAG-11'],
     },
   ];
+}
+
+// ---------------------------------------------------------------------------
+// Admin custom grounding rules (frontend mirror of server/groundingConfig.ts).
+// Same closed metric vocabulary, same breach semantics: ALL conditions true.
+// ---------------------------------------------------------------------------
+
+export interface CustomGroundingRuleInput {
+  id: string;
+  name: string;
+  category: 'PHYSICAL' | 'REGULATORY' | 'BATTERY_SAFETY' | 'GRID_CONSTRAINT' | 'MARKET';
+  severity: 'WARN' | 'FAIL';
+  conditions: Array<{ metric: string; op: '>' | '>=' | '<' | '<='; value: number }>;
+  message: string;
+}
+
+function customMetricValue(portfolio: PortfolioState, scenario: ScenarioCandidate, metric: string): number | null {
+  const clean = [...portfolio.solarFarms, ...portfolio.windFarms]
+    .reduce((s, a) => s + (a.status === 'online' ? a.currentOutputMw || 0 : 0), 0);
+  const dis = Object.values(scenario.batteryDispatchMw || {}).filter((v) => v > 0).reduce((s, v) => s + v, 0);
+  const net = scenario.gridNetImportMw || 0;
+  switch (metric) {
+    case 'freq_hz': return portfolio.grid?.frequencyHz ?? 50.0;
+    case 'demand_mw': return portfolio.grid?.totalDemandMw ?? 0;
+    case 'spot_price': return portfolio.market?.spotPriceUsdPerMwh ?? 0;
+    case 'clean_gen_mw': return clean;
+    case 'battery_discharge_mw': return dis;
+    case 'grid_import_mw': return Math.max(0, net);
+    case 'grid_export_mw': return Math.max(0, -net);
+    case 'curtail_mwh': return scenario.curtailmentMwh ?? 0;
+    case 'dr_shed_mw': return Object.values(scenario.demandResponseCurtailMw || {}).reduce((s, v) => s + (Number(v) || 0), 0);
+    case 'batt_min_soc': return portfolio.batteries.length ? Math.min(...portfolio.batteries.map((b) => b.currentSocPct)) : 100;
+    case 'batt_max_temp': return portfolio.batteries.length ? Math.max(...portfolio.batteries.map((b) => b.tempC || 0)) : 0;
+    case 'intertie_max_load_pct': {
+      const ls = portfolio.interties.map((l) => (Math.abs(l.currentFlowMw || 0) / (l.limitMw || 1)) * 100);
+      return ls.length ? Math.max(...ls) : 0;
+    }
+    default: return null;
+  }
+}
+
+function testCustomOp(op: string, left: number, right: number): boolean {
+  switch (op) {
+    case '>': return left > right;
+    case '>=': return left >= right;
+    case '<': return left < right;
+    case '<=': return left <= right;
+    default: return false;
+  }
+}
+
+export function evaluateCustomRules(
+  portfolio: PortfolioState,
+  scenario: ScenarioCandidate,
+  rules: CustomGroundingRuleInput[],
+): GroundingCheck[] {
+  const out: GroundingCheck[] = [];
+  for (const rule of rules || []) {
+    if (!rule || !Array.isArray(rule.conditions) || rule.conditions.length === 0) continue;
+    const parts: string[] = [];
+    let breach = true;
+    for (const c of rule.conditions) {
+      const v = customMetricValue(portfolio, scenario, c.metric);
+      if (v === null) { breach = false; break; }
+      const ok = testCustomOp(c.op, v, Number(c.value));
+      parts.push(`${c.metric} ${v} ${c.op} ${c.value}`);
+      if (!ok) breach = false;
+    }
+    if (!breach) continue;
+    out.push({
+      id: rule.id,
+      category: rule.category,
+      rule: `${rule.name} [custom rule]`,
+      status: rule.severity === 'FAIL' ? 'FAIL' : 'WARN',
+      detail: `${rule.message || 'Custom threshold breached'} (${parts.join(' AND ')})`,
+    });
+  }
+  return out;
 }

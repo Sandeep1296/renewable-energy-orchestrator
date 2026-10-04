@@ -127,6 +127,7 @@ export interface ScenarioCandidate {
   batteryDispatchMw: Record<string, number>; // batteryId -> MW (positive = discharge, negative = charge)
   curtailmentMw: { solar: number; wind: number };
   demandResponseCurtailMw: Record<string, number>; // consumerId -> MW curtailed
+  loadShiftMw?: Record<string, number>; // consumerId -> MW shifted to off-peak (rebound +1 cycle)
   gridNetImportMw: number; // positive = import from market, negative = export to market
   projectedCostUsd: number;
   projectedRevenueUsd: number;
@@ -161,7 +162,7 @@ export interface DAGNode {
 
 export interface GroundingCheck {
   id: string;
-  category: 'PHYSICAL' | 'REGULATORY' | 'BATTERY_SAFETY' | 'GRID_CONSTRAINT';
+  category: 'PHYSICAL' | 'REGULATORY' | 'BATTERY_SAFETY' | 'GRID_CONSTRAINT' | 'MARKET';
   rule: string;
   status: 'PASS' | 'WARN' | 'FAIL';
   detail: string;
@@ -172,7 +173,7 @@ export type HITLStatus = 'AUTONOMOUS' | 'SUPERVISED' | 'ADVISORY';
 export interface ActionCommand {
   assetId: string;
   assetName: string;
-  type: 'BATTERY_CHARGE' | 'BATTERY_DISCHARGE' | 'BATTERY_HOLD' | 'CURTAIL_SOLAR' | 'CURTAIL_WIND' | 'DEMAND_RESPONSE_TRIGGER' | 'GRID_EXPORT' | 'GRID_IMPORT';
+  type: 'BATTERY_CHARGE' | 'BATTERY_DISCHARGE' | 'BATTERY_HOLD' | 'CURTAIL_SOLAR' | 'CURTAIL_WIND' | 'DEMAND_RESPONSE_TRIGGER' | 'SHIFT_LOAD' | 'SCHEDULE_MAINTENANCE' | 'DELAY_MAINTENANCE' | 'DISPATCH_INSPECTION' | 'GRID_EXPORT' | 'GRID_IMPORT';
   valueMw: number;
   detail: string;
   precondition: string;
@@ -217,7 +218,7 @@ export interface ActiveAlert {
   id: string;
   timestamp: string;
   severity: 'info' | 'warning' | 'critical';
-  category: 'FREQUENCY' | 'MARKET' | 'THERMAL' | 'CONGESTION' | 'BATTERY' | 'WEATHER' | 'SOLAR' | 'DEMAND';
+  category: 'FREQUENCY' | 'MARKET' | 'THERMAL' | 'CONGESTION' | 'BATTERY' | 'WEATHER' | 'SOLAR' | 'DEMAND' | 'PHYSICAL' | 'REGULATORY' | 'BATTERY_SAFETY' | 'GRID_CONSTRAINT';
   title: string;
   message: string;
   sourceAssetId?: string;
@@ -268,6 +269,12 @@ export interface OrchestrationDecision {
   tradeoffs: Array<{ objective: string; impact: string }>;
   actions: ActionCommand[];
   groundingChecks: GroundingCheck[];
+  groundingPolicy?: {
+    powerBalanceToleranceMw?: number;
+    batteryPowerHeadroomMw?: number;
+    n1GateEnabled?: boolean;
+    n1UnservedThresholdMw?: number;
+  };
   auditHash: string;
   dagNodes: DAGNode[];
   carbonMetrics: CarbonMetrics;

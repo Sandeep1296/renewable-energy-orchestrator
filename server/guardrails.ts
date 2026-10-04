@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { loadPolicy, DEFAULT_POLICY, loadCustomRules, runCustomRules } from './groundingConfig.js';
 
 export const PortfolioSchema = z.object({
   solarFarms: z.array(z.object({ id: z.string(), status: z.string(), currentOutputMw: z.number() }).passthrough()),
@@ -26,7 +27,7 @@ export const WeightsSchema = z.object({
 
 export interface GroundingCheck {
   id: string;
-  category: 'PHYSICAL' | 'REGULATORY' | 'BATTERY_SAFETY' | 'GRID_CONSTRAINT';
+  category: 'PHYSICAL' | 'REGULATORY' | 'BATTERY_SAFETY' | 'GRID_CONSTRAINT' | 'MARKET';
   rule: string;
   status: 'PASS' | 'WARN' | 'FAIL';
   detail: string;
@@ -34,16 +35,30 @@ export interface GroundingCheck {
 
 /** Non-bypassable physics + regulatory gates. FAIL = block execution. */
 export function runGuardrails(portfolio: any, scenario: any): GroundingCheck[] {
+  let policy = DEFAULT_POLICY;
+  try {
+    policy = loadPolicy();
+  } catch { /* safe defaults */ }
+  return runGuardrailsWith(portfolio, scenario, policy);
+}
+
+/** Guardrail evaluation against an explicit policy (admin-tunable tolerances). */
+export function runGuardrailsWith(
+  portfolio: any,
+  scenario: any,
+  policy: { powerBalanceToleranceMw: number; batteryPowerHeadroomMw: number; n1GateEnabled?: boolean; n1UnservedThresholdMw?: number },
+): GroundingCheck[] {
   const checks: GroundingCheck[] = [];
   const batteries: any[] = portfolio.batteries || [];
   batteries.forEach((b) => {
     const p = Math.abs(scenario.batteryDispatchMw?.[b.id] || 0);
-    const pass = b.status === 'fault' ? p === 0 : p <= (b.powerRatingMw || 0) + 0.1;
+    const limit = (b.powerRatingMw || 0) + policy.batteryPowerHeadroomMw;
+    const pass = b.status === 'fault' ? p === 0 : p <= limit;
     checks.push({
       id: `PHYS-BATT-${b.id}`, category: 'BATTERY_SAFETY',
-      rule: `${b.id} dispatch within rating (faulted packs must read 0)`,
+      rule: `${b.id} dispatch within rating + ${policy.batteryPowerHeadroomMw} MW headroom (faulted packs must read 0)`,
       status: pass ? 'PASS' : 'FAIL',
-      detail: `Dispatch ${p.toFixed(1)} MW / limit ${(b.powerRatingMw || 0).toFixed(1)} MW, status=${b.status}`,
+      detail: `Dispatch ${p.toFixed(1)} MW / limit ${(b.powerRatingMw || 0).toFixed(1)} MW (+${policy.batteryPowerHeadroomMw} headroom), status=${b.status}`,
     });
     const discharging = (scenario.batteryDispatchMw?.[b.id] || 0) > 0;
     const socOk = !discharging || b.currentSocPct > b.minSocPct;
@@ -69,18 +84,79 @@ export function runGuardrails(portfolio: any, scenario: any): GroundingCheck[] {
     status: freq >= 49.5 && freq <= 50.5 ? 'PASS' : 'WARN',
     detail: `Frequency ${Number(freq).toFixed(2)} Hz`,
   });
-  // Conservation residual
-  const totalGen = [...(portfolio.solarFarms || []), ...(portfolio.windFarms || [])]
+  // Conservation residual — real First-Law equation against the scenario's
+  // assumed inputs (stored at compute time), tolerance is admin-tunable.
+  const totalGen = scenario.assumedCleanGenMw ?? [...(portfolio.solarFarms || []), ...(portfolio.windFarms || [])]
     .reduce((s: number, a: any) => s + (a.status === 'online' ? a.currentOutputMw || 0 : 0), 0);
   const bSum: number = Object.values(scenario.batteryDispatchMw || {}).reduce((s: number, v: any) => s + (Number(v) || 0), 0);
   const drShed: number = Object.values(scenario.demandResponseCurtailMw || {}).reduce((s: number, v: any) => s + (Number(v) || 0), 0);
+  const shifted: number = Object.values(scenario.loadShiftMw || {}).reduce((s: number, v: any) => s + (Number(v) || 0), 0);
+  const effectiveDemand = (scenario.assumedDemandMw ?? portfolio.grid?.totalDemandMw ?? 0) - drShed - shifted;
+  const netExchange = scenario.gridNetImportMw || 0;
+  const curtail = (scenario.curtailmentMw?.solar || 0) + (scenario.curtailmentMw?.wind || 0);
+  const supply = totalGen + Math.max(0, netExchange) + Math.max(0, bSum);
+  const demandSide = effectiveDemand + Math.max(0, -netExchange) + Math.max(0, -bSum) + curtail;
+  const residual = Math.abs(supply - demandSide);
+  const balancePass = residual < policy.powerBalanceToleranceMw;
   checks.push({
     id: 'PHYS-CONSERV-ENERGY', category: 'PHYSICAL',
-    rule: 'First-law closure: residual variance < 1.0 MW equivalent',
-    status: 'PASS',
-    detail: `Clean ${totalGen.toFixed(1)} MW, batt ${bSum.toFixed(1)} MW, DR shed ${drShed.toFixed(1)} MW — balance closed by construction`,
+    rule: `First-law closure: residual variance < ${policy.powerBalanceToleranceMw} MW equivalent`,
+    status: balancePass ? 'PASS' : 'FAIL',
+    detail: `Supply: ${supply.toFixed(1)} MW / Demand+Storage: ${demandSide.toFixed(1)} MW (Delta: ${residual.toFixed(2)} MW, tolerance ${policy.powerBalanceToleranceMw} MW)`,
   });
+  // Admin custom rules (each audited at creation/deletion)
+  try {
+    for (const c of runCustomRules(portfolio, scenario, loadCustomRules())) checks.push(c);
+  } catch { /* custom rules never break built-ins */ }
+  // N-1 contingency screen (toggleable; degrade-safe: any error skips, never blocks)
+  if (policy.n1GateEnabled !== false) {
+    try {
+      const n1 = evaluateN1(portfolio, scenario, policy.n1UnservedThresholdMw ?? 25);
+      checks.push({
+        id: 'N1-CONTINGENCY', category: 'GRID_CONSTRAINT',
+        rule: `N-1 secure: worst single loss leaves < ${(policy.n1UnservedThresholdMw ?? 25)} MW unserved`,
+        status: n1.breach ? 'FAIL' : 'PASS',
+        detail: n1.breach
+          ? `VIOLATION under ${n1.worstCase} (${n1.unservedMw} MW unserved after storage) — staged for human review`
+          : `Worst single loss (${n1.worstCase}) leaves ${n1.unservedMw} MW unserved — within tolerance`,
+      });
+    } catch { /* N-1 never blocks on its own errors */ }
+  }
   return checks;
+}
+
+/** N-1 screen: remove each intertie and each online generator once; measure
+ *  unserved demand after battery cover. Pure math, no external data. */
+export function evaluateN1(
+  portfolio: any,
+  scenario: any,
+  thresholdMw = 25,
+): { breach: boolean; worstCase: string; unservedMw: number } {
+  const cleanOf = (p: any) => [...(p.solarFarms || []), ...(p.windFarms || [])]
+    .reduce((s: number, a: any) => s + (a.status === 'online' ? a.currentOutputMw || 0 : 0), 0);
+  const battOf = (p: any) => (p.batteries || [])
+    .filter((b: any) => b.status !== 'fault' && b.status !== 'maintenance' && b.currentSocPct > b.minSocPct)
+    .reduce((s: number, b: any) => s + Math.min(b.powerRatingMw || 0, ((b.currentSocPct - b.minSocPct) / 100) * (b.capacityMwh || 0) * 4), 0);
+  const drShed: number = Object.values(scenario.demandResponseCurtailMw || {}).reduce((s: number, v: any) => s + (Number(v) || 0), 0);
+  const shifted: number = Object.values(scenario.loadShiftMw || {}).reduce((s: number, v: any) => s + (Number(v) || 0), 0);
+  const demand = (portfolio.grid?.totalDemandMw ?? 0) - drShed - shifted;
+  const unservedAfter = (gen: number) => Math.max(0, Math.round((demand - gen - battOf(portfolio)) * 10) / 10);
+
+  let worst = { breach: false, worstCase: 'none', unservedMw: 0 };
+  const consider = (label: string, gen: number) => {
+    const u = unservedAfter(gen);
+    if (u > thresholdMw && u >= worst.unservedMw) worst = { breach: true, worstCase: label, unservedMw: u };
+    else if (!worst.breach && u > worst.unservedMw) worst = { ...worst, worstCase: label, unservedMw: u };
+  };
+  for (const i of portfolio.interties || []) {
+    const exp = Math.min(Math.max(0, cleanOf(portfolio) - demand), i.limitMw || 0);
+    consider(`loss of ${i.id} (${exp} MW export path)`, cleanOf(portfolio));
+  }
+  for (const a of [...(portfolio.solarFarms || []), ...(portfolio.windFarms || [])]) {
+    if (a.status !== 'online') continue;
+    consider(`loss of ${a.id} (${a.currentOutputMw || 0} MW)`, cleanOf(portfolio) - (a.currentOutputMw || 0));
+  }
+  return worst;
 }
 
 export interface HitlAssessment { status: 'AUTONOMOUS' | 'SUPERVISED' | 'ADVISORY'; reasons: string[]; critical: boolean }

@@ -15,7 +15,7 @@ import {
   AlertThresholds,
   ActiveAlert,
 } from './types/orchestrator';
-import { runOrchestrationEngine, runGroundingValidation, calculateConfidence, generateActionCommands } from './services/orchestrationEngine';
+import { runOrchestrationEngine, runGroundingValidation, calculateConfidence, generateActionCommands, evaluateCustomRules } from './services/orchestrationEngine';
 import { defaultAlertThresholds, evaluateActiveAlerts } from './services/alertEvaluator';
 import { TopNav, TabId } from './components/TopNav';
 import { ObjectiveWeightsPanel } from './components/ObjectiveWeightsPanel';
@@ -38,6 +38,9 @@ import { AgentSkillsPanel } from './components/AgentSkillsPanel';
 import { RoleBanner } from './components/RoleBanner';
 import { CycleProgress } from './components/CycleProgress';
 import { CollapsibleSection } from './components/CollapsibleSection';
+import { EvalPanel } from './components/EvalPanel';
+import { GraphPanel } from './components/GraphPanel';
+import { GroundingPolicyPanel } from './components/GroundingPolicyPanel';
 import { ScenarioSelectionExplainer } from './components/ScenarioSelectionExplainer';
 import { DataGroundingModal } from './components/DataGroundingModal';
 import { authHeaders, usePermissions } from './auth/ClerkWrapper';
@@ -86,6 +89,15 @@ export default function App() {
 
   // Decision Engine Mode Switch: Mock Data vs Backend Agentic Flow
   const [decisionMode, setDecisionMode] = useState<'mock' | 'agentic'>('agentic');
+  // Admin-tunable grounding policy (shared with the approval modal's gates)
+  const [groundingPolicy, setGroundingPolicy] = useState<{ powerBalanceToleranceMw: number; batteryPowerHeadroomMw: number } | null>(null);
+  const [customRules, setCustomRules] = useState<any[]>([]);
+  useEffect(() => {
+    fetch('/api/grounding/config').then((r) => r.json()).then((j) => {
+      if (j.policy) setGroundingPolicy(j.policy);
+      if (Array.isArray((j as any).customRules)) setCustomRules((j as any).customRules);
+    }).catch(() => {});
+  }, []);
   // Operator-disabled strategies (excluded from ranking; supervisor cannot pick them)
   const [disabledScenarios, setDisabledScenarios] = useState<string[]>([]);
   // Strict AI demo mode: hold dispatch when LLMs are unreachable (no fallback rows)
@@ -185,7 +197,7 @@ export default function App() {
       }
     } catch (err) {
       console.warn('Backend agentic flow fallback to local engine:', err);
-      const fallbackDecision = runOrchestrationEngine(targetPortfolio, targetWeights, decision, disabledScenarios);
+      const fallbackDecision = runOrchestrationEngine(targetPortfolio, targetWeights, decision, disabledScenarios, customRules, groundingPolicy || undefined);
       setDecision(fallbackDecision);
       stampRun('failed');
     } finally {
@@ -215,7 +227,7 @@ export default function App() {
       console.log(`[dispatch] auto boot=${boot} keyhash=${h.toString(36)}`);
       executeAgenticFlow(undefined, undefined, 'auto');
     } else {
-      const newDecision = runOrchestrationEngine(portfolio, weights, decision, disabledScenarios);
+      const newDecision = runOrchestrationEngine(portfolio, weights, decision, disabledScenarios, customRules, groundingPolicy || undefined);
       setDecision(newDecision);
 
       if (newDecision.hitlStatus !== 'AUTONOMOUS' && !newDecision.hitlApproved) {
@@ -356,22 +368,40 @@ export default function App() {
       const c = (window as any).Clerk;
       approver = c?.user?.primaryEmailAddress?.emailAddress || c?.user?.id || 'local-operator';
     } catch { /* ignore */ }
-    if (pendingId) {
-      try {
-        const h = await authHeaders();
-        const r = await fetch(`/api/hitl/${pendingId}/approve`, { method: 'POST', headers: h });
-        if (!r.ok) throw new Error('Approval rejected by server');
-        toast(`Staged plan ${pendingId} approved — actuators released.`, 'success');
-      } catch (e) {
-        console.warn('HITL approve call failed, marking locally:', e);
-        toast('Backend approval failed — marked locally only.', 'error');
-      }
-    } else {
+    const markApproved = () => {
+      setDecision((prev) => ({ ...prev, hitlApproved: true, approvedBy: approver }));
+      // Flip the audit row from "staged" to "AI proposed · human approved"
+      setHistory((prev) => prev.map((h) => (h.decisionId === decision.decisionId ? { ...h, hitlApproved: true, approvedBy: approver } : h)));
+    };
+    if (!pendingId) {
+      markApproved();
       toast('Strategy approved.', 'success');
+      return;
     }
-    setDecision((prev) => ({ ...prev, hitlApproved: true, approvedBy: approver }));
-    // Flip the audit row from "staged" to "AI proposed · human approved"
-    setHistory((prev) => prev.map((h) => (h.decisionId === decision.decisionId ? { ...h, hitlApproved: true, approvedBy: approver } : h)));
+    let r: Response;
+    try {
+      const h = await authHeaders();
+      r = await fetch(`/api/hitl/${pendingId}/approve`, { method: 'POST', headers: h });
+    } catch {
+      toast('Backend unreachable — approval NOT recorded. Retry when online.', 'error');
+      return;
+    }
+    if (r.ok) {
+      markApproved();
+      toast(`Staged plan ${pendingId} approved — actuators released.`, 'success');
+      return;
+    }
+    let detail = '';
+    try { detail = (await r.json()).error || ''; } catch { /* ignore */ }
+    if (r.status === 401) {
+      toast('Sign-in required: your session is missing or expired. Sign in and retry — NOT approved.', 'error');
+    } else if (r.status === 403) {
+      toast(`Forbidden (${detail || 'role lacks approve permission'}) — NOT approved.`, 'error');
+    } else if (r.status === 404) {
+      toast('Plan already resolved or expired on the server — NOT approved. Re-run dispatch for a fresh staged plan.', 'error');
+    } else {
+      toast(`Approval failed (${r.status} ${detail}) — NOT approved.`, 'error');
+    }
   };
 
   // Operator picks a different ranked strategy: re-validate grounding, rebuild
@@ -384,7 +414,10 @@ export default function App() {
         await fetch(`/api/hitl/${pendingId}/reject`, { method: 'POST', headers: h });
       } catch { /* local-only fallback */ }
     }
-    const checks = runGroundingValidation(sc, portfolio);
+    const checks = runGroundingValidation(sc, portfolio, groundingPolicy || undefined);
+    try {
+      checks.push(...evaluateCustomRules(portfolio, sc, customRules));
+    } catch { /* custom rules never break built-ins */ }
     const actions = generateActionCommands(sc, portfolio);
     const conf = calculateConfidence(portfolio, sc, checks);
     setDecision((prev) => ({
@@ -575,7 +608,7 @@ export default function App() {
               selectedScenario={decision.selectedScenario}
               actions={decision.actions}
             />
-            <GroundingAndSafetyPanel checks={decision.groundingChecks} />
+            <GroundingAndSafetyPanel checks={decision.groundingChecks} policy={(decision as any).groundingPolicy || groundingPolicy} />
           </div>
         )}
 
@@ -602,7 +635,7 @@ export default function App() {
               scenarios={decision.allScenarios}
               selectedScenario={decision.selectedScenario}
             />
-            <GroundingAndSafetyPanel checks={decision.groundingChecks} />
+            <GroundingAndSafetyPanel checks={decision.groundingChecks} policy={(decision as any).groundingPolicy || groundingPolicy} />
           </div>
         )}
 
@@ -617,7 +650,7 @@ export default function App() {
                 setPortfolio((p) => ({ ...p, market: { ...p.market, carbonPriceUsdPerTon: newPrice } }))
               : undefined}
             />
-            <GroundingAndSafetyPanel checks={decision.groundingChecks} />
+            <GroundingAndSafetyPanel checks={decision.groundingChecks} policy={(decision as any).groundingPolicy || groundingPolicy} />
           </div>
         )}
 
@@ -640,7 +673,7 @@ export default function App() {
               modelUsed={decision.agenticTrace?.modelUsed}
             />
             <DecisionExplainability decision={decision} portfolio={portfolio} />
-            <GroundingAndSafetyPanel checks={decision.groundingChecks} />
+            <GroundingAndSafetyPanel checks={decision.groundingChecks} policy={(decision as any).groundingPolicy || groundingPolicy} />
           </div>
         )}
 
@@ -655,7 +688,7 @@ export default function App() {
               onAutoMitigateAlert={handleAutoMitigateAlert}
               portfolio={portfolio}
             />
-            <GroundingAndSafetyPanel checks={decision.groundingChecks} />
+            <GroundingAndSafetyPanel checks={decision.groundingChecks} policy={(decision as any).groundingPolicy || groundingPolicy} />
           </div>
         )}
 
@@ -693,6 +726,30 @@ export default function App() {
               defaultOpen={false}
             >
               <RAGKnowledgeDrawer />
+            </CollapsibleSection>
+            <CollapsibleSection
+              storageKey="knowledge-graph"
+              title="Graph database (topology mirror)"
+              subtitle="Run directly against Neo4j Aura · seed · verify counts"
+              defaultOpen={false}
+            >
+              <GraphPanel portfolio={portfolio} />
+            </CollapsibleSection>
+            <CollapsibleSection
+              storageKey="knowledge-grounding"
+              title="Grounding policy (admin-tunable tolerances)"
+              subtitle="Sensitivity bands only — physical law stays hardcoded · every edit audited"
+              defaultOpen={false}
+            >
+              <GroundingPolicyPanel />
+            </CollapsibleSection>
+            <CollapsibleSection
+              storageKey="knowledge-evals"
+              title="Evaluation suites"
+              subtitle="Deterministic invariants + quota-aware LLM judge"
+              defaultOpen={false}
+            >
+              <EvalPanel />
             </CollapsibleSection>
             <CollapsibleSection
               storageKey="knowledge-skills"
